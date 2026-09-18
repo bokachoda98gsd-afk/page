@@ -1,0 +1,50 @@
+{
+  "0bd84dae": {
+    "id": "0bd84dae",
+    "name": "Task 2",
+    "cookie": "datr=2HWtakqdGuAbe46QFyJMwzr8;sb=2HWtagCxO_Z2bzo6Yij6wmo0;m_pixel_ratio=3;dpr=3;wd=980x1764;c_user=61594387953864;ps_l=1;ps_n=1;fr=1sfngWenvrwyy8OYS.AWeByhXKfoPwOtfPS3xLC9HcA7prbPYtkNAIRsQm6U8K00rXxD4.BqrXYF..AAA.0.0.BqrXYF.AWf23N7g1AzNkOI8Jypsf6HG-iM;xs=43%3A536quLo6EIEgxA%3A2%3A1789752831%3A-1%3A-1%3A%3AAcwoqOhEEx82qLf9OSmfasDoXCb6WXk5Zv8RvCQk5w;presence=C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1789752843577%2C%22v%22%3A1%7D;",
+    "user_id": "61594387953864",
+    "target": 10,
+    "interval_min": 10,
+    "created": 6,
+    "status": "running",
+    "history": [
+      {
+        "name": "Bright Nest 883",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2341640422&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T01:09:07.887310"
+      },
+      {
+        "name": "Cosmic Zone 401",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2962288828&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T01:20:04.631375"
+      },
+      {
+        "name": "Solar Zone 148",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=1981971059&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T01:31:00.916974"
+      },
+      {
+        "name": "Golden Media 610",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=1264038937&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T01:41:55.832317"
+      },
+      {
+        "name": "Nova Pulse 457",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2765193324&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T01:52:52.727299"
+      },
+      {
+        "name": "Prime Circle 676",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2314604318&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T02:03:49.813257"
+      }
+    ],
+    "created_at": "2026-09-19T01:08:11.161874",
+    "chat_id": 5705479420,
+    "current_step": "Idle",
+    "error": null,
+    "next_run_at": "2026-09-19T02:13:49.852240",
+    "last_page": "Prime Circle 676"
+  }
+}
