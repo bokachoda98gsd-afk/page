@@ -18,33 +18,38 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, filters, ContextTypes,
 )
+from telegram.error import Conflict, RetryAfter, TimedOut, NetworkError
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ============================================================
-#  LOGGING SETUP (For Railway Logs)
+#  LOGGING
 # ============================================================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+# Silence noisy httpx logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", 0))   # admin
+ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", 0))
 
 # ============================================================
-#  HEADLESS MODE (toggle at runtime with /headless=true|false)
+#  HEADLESS MODE
 # ============================================================
 HEADLESS = True
 
 # ============================================================
-#  CONCURRENCY LIMIT (VPS safety)
+#  CONCURRENCY LIMIT
+#  Railway starter (1GB) → 1
+#  Railway hobby (2GB)   → 2
 # ============================================================
-MAX_CONCURRENT_BROWSERS = 3
+MAX_CONCURRENT_BROWSERS = int(os.getenv("MAX_CONCURRENT_BROWSERS", 1))
 
 # ============================================================
-#  CHROMIUM ARGS (VPS-critical)
+#  CHROMIUM ARGS (VPS/Railway-critical)
 # ============================================================
 CHROMIUM_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -59,27 +64,47 @@ CHROMIUM_ARGS = [
     "--mute-audio",
     "--no-first-run",
     "--no-zygote",
+    "--single-process",              # ← critical for Railway low memory
     "--js-flags=--max-old-space-size=256",
 ]
 
-# Use absolute paths for Railway Volumes if needed, otherwise relative
-TASKS_FILE = os.getenv("TASKS_FILE", "tasks.json")
-USERS_FILE = os.getenv("USERS_FILE", "users.json")
+# ============================================================
+#  STORAGE PATHS
+#  Set these to /app/data/... when using Railway Volume
+# ============================================================
+DATA_DIR = os.getenv("DATA_DIR", ".")
+TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
+Path(SCREENSHOT_DIR).mkdir(parents=True, exist_ok=True)
 
 running_tasks = {}
-active_message = {}
-auto_refresh_task = {}
 BROWSER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
 
 MAX_MSG = 3800
 MAX_ERR = 300
-REFRESH_INTERVAL = 8
-REFRESH_MAX_AGE = 30 * 60
 
-POST_CREATE_WAIT_MS = 20000   # ← 20 seconds
+POST_CREATE_WAIT_MS = 20000
 
 (ASK_COOKIE, ASK_COUNT, ASK_INTERVAL,
  EDIT_CHOICE, EDIT_INTERVAL, EDIT_TARGET) = range(6)
+
+
+# ============================================================
+#  STARTUP HEALTH CHECK
+# ============================================================
+async def check_playwright():
+    """Verify Playwright can launch Chromium. Logs result."""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+            version = browser.version
+            await browser.close()
+            logger.info(f"✅ Playwright OK — Chromium {version}")
+            return True
+    except Exception as e:
+        logger.error(f"❌ Playwright FAILED: {e}")
+        return False
 
 
 # ============================================================
@@ -101,6 +126,7 @@ def load_users() -> set:
 
 def save_users(users: set):
     try:
+        Path(USERS_FILE).parent.mkdir(parents=True, exist_ok=True)
         with open(USERS_FILE, "w") as f:
             json.dump(sorted(int(u) for u in users), f, indent=2)
     except Exception as e:
@@ -180,14 +206,16 @@ async def safe_edit(q, text: str, reply_markup=None, parse_mode="Markdown"):
     try:
         await q.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         return
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
+        try:
+            await q.edit_message_text(text, reply_markup=reply_markup)
+        except Exception:
+            pass
     except Exception as e:
         err = str(e).lower()
-        if any(k in err for k in ["parse", "entit", "bad request", "can't find"]):
-            try:
-                await q.edit_message_text(text, reply_markup=reply_markup)
-                return
-            except Exception:
-                pass
+        if any(k in err for k in ["parse", "entit", "bad request", "can't find", "not modified"]):
+            return
         try:
             await q.message.reply_text(text, reply_markup=reply_markup)
         except Exception:
@@ -224,20 +252,19 @@ async def cmd_headless(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if val in ("true", "1", "on", "yes"):
         HEADLESS = True
         await update.message.reply_text(
-            "✅ *HEADLESS = True*\nBrowser will run silently (production mode).",
+            "✅ *HEADLESS = True*\nBrowser will run silently.",
             parse_mode="Markdown",
         )
     elif val in ("false", "0", "off", "no"):
         HEADLESS = False
         await update.message.reply_text(
-            "✅ *HEADLESS = False*\nBrowser will run visible on VPS screen (debug mode).\n"
-            "⚠️ Requires a display (Xvfb) on VPS.",
+            "✅ *HEADLESS = False*\n⚠️ Only works with Xvfb display.",
             parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
             f"ℹ️ Current: *HEADLESS = {HEADLESS}*\n\n"
-            f"Usage:\n`/headless=true` → silent\n`/headless=false` → visible (debug)",
+            f"`/headless=true` or `/headless=false`",
             parse_mode="Markdown",
         )
 
@@ -255,7 +282,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID.")
         return
     if is_admin(new_id):
-        await update.message.reply_text("ℹ️ That ID is the admin (already authorized).")
+        await update.message.reply_text("ℹ️ That ID is the admin.")
         return
     users = load_users()
     if new_id in users:
@@ -263,14 +290,9 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     users.add(new_id)
     save_users(users)
-    await update.message.reply_text(
-        f"✅ Added `{new_id}` to the whitelist.", parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"✅ Added `{new_id}`.", parse_mode="Markdown")
     try:
-        await ctx.bot.send_message(
-            new_id,
-            "✅ You've been granted access to this bot. Send /start to begin."
-        )
+        await ctx.bot.send_message(new_id, "✅ Access granted. Send /start to begin.")
     except Exception:
         pass
 
@@ -288,19 +310,17 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID.")
         return
     if is_admin(rid):
-        await update.message.reply_text("❌ Cannot remove the admin.")
+        await update.message.reply_text("❌ Cannot remove admin.")
         return
     users = load_users()
     if rid not in users:
-        await update.message.reply_text(f"ℹ️ `{rid}` is not in the whitelist.", parse_mode="Markdown")
+        await update.message.reply_text(f"ℹ️ `{rid}` not in whitelist.", parse_mode="Markdown")
         return
     users.discard(rid)
     save_users(users)
-    await update.message.reply_text(
-        f"🗑️ Removed `{rid}` from the whitelist.", parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"🗑️ Removed `{rid}`.", parse_mode="Markdown")
     try:
-        await ctx.bot.send_message(rid, "⛔ Your access to this bot has been revoked.")
+        await ctx.bot.send_message(rid, "⛔ Your access has been revoked.")
     except Exception:
         pass
 
@@ -320,74 +340,22 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-# ============================================================
-#  AUTO-REFRESH
-# ============================================================
-def _build_refresh_payload(chat_id):
-    info = active_message.get(chat_id)
-    if not info:
-        return None
-    kind = info.get("kind")
-    if kind == "list":
-        tasks = load_tasks()
-        return task_list_text(tasks), task_list_kb(tasks)
-    if kind == "detail":
-        t = get_task(info.get("tid"))
-        if not t:
-            return None
-        return task_detail_text(t), task_detail_kb(info["tid"], t.get("status", "idle"))
-    return None
-
-
-async def _auto_refresh_worker(bot, chat_id):
-    started = datetime.now()
-    try:
-        while True:
-            await asyncio.sleep(REFRESH_INTERVAL)
-            if (datetime.now() - started).total_seconds() > REFRESH_MAX_AGE:
-                return
-            info = active_message.get(chat_id)
-            if not info:
-                return
-            payload = _build_refresh_payload(chat_id)
-            if not payload:
-                return
-            text, kb = payload
-            edited = False
-            for pm in ("Markdown", None):
-                try:
-                    await bot.edit_message_text(
-                        truncate_msg(text),
-                        chat_id=chat_id,
-                        message_id=info["msg_id"],
-                        reply_markup=kb,
-                        parse_mode=pm,
-                    )
-                    edited = True
-                    break
-                except Exception as e:
-                    if "not modified" in str(e).lower():
-                        edited = True
-                        break
-                    continue
-            if not edited:
-                return
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.error(f"[refresh] {e}")
-    finally:
-        auto_refresh_task.pop(chat_id, None)
-
-
-def set_active_message(chat_id: int, msg_id: int, kind: str, tid: str = None, bot=None):
-    active_message[chat_id] = {"msg_id": msg_id, "kind": kind, "tid": tid}
-    if bot is None:
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: test Playwright from inside the container."""
+    if not authorized(update) or not is_admin(update.effective_user.id):
+        await deny_message(update)
         return
-    existing = auto_refresh_task.get(chat_id)
-    if existing and not existing.done():
-        existing.cancel()
-    auto_refresh_task[chat_id] = asyncio.create_task(_auto_refresh_worker(bot, chat_id))
+    await update.message.reply_text("🧪 Testing Playwright...")
+    ok = await check_playwright()
+    if ok:
+        await update.message.reply_text("✅ Playwright works!")
+    else:
+        await update.message.reply_text(
+            "❌ Playwright FAILED.\n\nCheck logs. Common causes:\n"
+            "• Dockerfile not based on `mcr.microsoft.com/playwright/python`\n"
+            "• `playwright install chromium` not run during build\n"
+            "• Out of memory"
+        )
 
 
 # ============================================================
@@ -406,6 +374,7 @@ def load_tasks() -> dict:
 
 def save_tasks(tasks: dict):
     try:
+        Path(TASKS_FILE).parent.mkdir(parents=True, exist_ok=True)
         with open(TASKS_FILE, "w") as f:
             json.dump(tasks, f, indent=2)
     except Exception as e:
@@ -565,9 +534,9 @@ async def fill_category(page, input_loc, category_text="Entertainment", max_retr
 
 
 # ============================================================
-#  CREATE ONE PAGE  (Semaphore-limited for VPS)
+#  CREATE ONE PAGE
 # ============================================================
-async def create_one_page(cookie: str, log=None):
+async def create_one_page(cookie: str, log=None, tid: str = "unknown"):
     async def note(msg):
         if log:
             try:
@@ -584,6 +553,7 @@ async def create_one_page(cookie: str, log=None):
                 slow_mo=250 if not HEADLESS else 0,
                 args=CHROMIUM_ARGS,
             )
+            page = None
             try:
                 context = await browser.new_context(
                     user_agent=(
@@ -614,7 +584,7 @@ async def create_one_page(cookie: str, log=None):
                 )
                 await page.wait_for_timeout(4000)
 
-                # 3. CREATE PAGE (top)
+                # 3. CREATE PAGE
                 await note("🖱️ Clicking Create Page...")
                 btn = page.locator('[aria-label="Create Page"]').first
                 await btn.wait_for(state="visible", timeout=20000)
@@ -628,8 +598,8 @@ async def create_one_page(cookie: str, log=None):
                 await public_label.click()
                 await page.wait_for_timeout(1200)
 
-                # 5. NEXT (option modal)
-                await note("🖱️ Next (option step)...")
+                # 5. NEXT
+                await note("🖱️ Next...")
                 await page.locator('[aria-label="Next"]').first.click()
                 await page.wait_for_timeout(3000)
 
@@ -655,14 +625,14 @@ async def create_one_page(cookie: str, log=None):
                 await page.wait_for_timeout(1000)
 
                 # 8. CATEGORY
-                await note("🔍 Selecting category: Entertainment...")
+                await note("🔍 Category...")
                 cat_input = page.locator('input[aria-label="Category (required)"]').first
                 await cat_input.wait_for(state="attached", timeout=20000)
                 if not await fill_category(page, cat_input, "Entertainment", max_retries=3):
-                    raise RuntimeError("Category selection failed after 3 attempts.")
+                    raise RuntimeError("Category selection failed.")
 
-                # 9. FOOTER CREATE PAGE → WAIT 20s → RELOAD
-                await note("🖱️ Clicking footer Create Page...")
+                # 9. FOOTER CREATE
+                await note("🖱️ Creating page...")
                 footer_btn = page.locator('[aria-label="Create Page"]').last
                 for _ in range(15):
                     if (await footer_btn.get_attribute("aria-disabled")) != "true":
@@ -670,10 +640,10 @@ async def create_one_page(cookie: str, log=None):
                     await page.wait_for_timeout(500)
                 await footer_btn.click()
 
-                await note("⏳ Waiting 20s for page to be created...")
+                await note("⏳ Waiting 20s...")
                 await page.wait_for_timeout(POST_CREATE_WAIT_MS)
 
-                await note("🔄 Refreshing page...")
+                await note("🔄 Refreshing...")
                 try:
                     await page.reload(wait_until="domcontentloaded", timeout=60000)
                 except Exception as e:
@@ -684,6 +654,17 @@ async def create_one_page(cookie: str, log=None):
                 await note("✅ Page created.")
 
                 return {"name": page_name, "url": final_url, "success": True}
+
+            except Exception as e:
+                # Save debug screenshot
+                try:
+                    if page:
+                        shot = os.path.join(SCREENSHOT_DIR, f"{tid}_{int(datetime.now().timestamp())}.png")
+                        await page.screenshot(path=shot, full_page=True)
+                        logger.error(f"Screenshot saved: {shot}")
+                except Exception:
+                    pass
+                raise
             finally:
                 await browser.close()
 
@@ -714,7 +695,7 @@ async def run_task(bot, tid: str):
                 try:
                     await bot.send_message(
                         chat_id,
-                        f"🎉 *{t.get('name')}* completed — {t.get('target')} pages created.",
+                        f"🎉 *{t.get('name')}* completed — {t.get('target')} pages.",
                         parse_mode="Markdown",
                     )
                 except Exception:
@@ -727,7 +708,7 @@ async def run_task(bot, tid: str):
                 update_task(tid, current_step=msg)
 
             try:
-                result = await create_one_page(t["cookie"], log=log)
+                result = await create_one_page(t["cookie"], log=log, tid=tid)
             except Exception as e:
                 err = sanitize_error(e)
                 update_task(tid, status="failed", error=err, current_step="Failed")
@@ -735,7 +716,7 @@ async def run_task(bot, tid: str):
                     await bot.send_message(
                         chat_id,
                         f"💥 *{t.get('name')}* failed:\n`{err}`\n\n"
-                        f"Tap 📋 Task → select this task to retry, edit, or delete.",
+                        f"Tap 📋 Task → select to retry, edit, or delete.",
                         parse_mode="Markdown",
                     )
                 except Exception:
@@ -763,7 +744,7 @@ async def run_task(bot, tid: str):
                 await bot.send_message(
                     chat_id,
                     f"✅ Page {t2['created']}/{t2['target']} created!\n"
-                    f"✅ user : {user_id}\n"
+                    f"👤 user : {user_id}\n"
                     f"📛 {result['name']}",
                 )
             except Exception:
@@ -807,7 +788,7 @@ async def run_task(bot, tid: str):
         logger.error(f"[run_task] {e}")
         if chat_id:
             try:
-                await bot.send_message(chat_id, f"💥 Task runner crashed: {sanitize_error(e)}")
+                await bot.send_message(chat_id, f"💥 Task crashed: {sanitize_error(e)}")
             except Exception:
                 pass
     finally:
@@ -936,7 +917,8 @@ async def show_task_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         task_list_text(tasks), reply_markup=task_list_kb(tasks), parse_mode="Markdown",
     )
-    set_active_message(update.effective_chat.id, msg.message_id, "list", bot=ctx.bot)
+    # Store msg_id for manual refresh
+    ctx.chat_data["last_msg_id"] = msg.message_id
 
 
 async def cb_show_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -957,14 +939,12 @@ async def cb_show_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not t:
         await safe_edit(q, "⚠️ *Task not found.*",
                         reply_markup=InlineKeyboardMarkup(
-                            [[InlineKeyboardButton("⬅️ Back to Tasks",
-                                                   callback_data="back_to_tasks")]]),
+                            [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_tasks")]]),
                         parse_mode="Markdown")
         return
     await safe_edit(q, task_detail_text(t),
                     reply_markup=task_detail_kb(tid, t.get("status", "idle")),
                     parse_mode="Markdown")
-    set_active_message(q.message.chat_id, q.message.message_id, "detail", tid=tid, bot=ctx.bot)
 
 
 async def cb_back_to_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -979,10 +959,10 @@ async def cb_back_to_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tasks = load_tasks()
     await safe_edit(q, task_list_text(tasks), reply_markup=task_list_kb(tasks),
                     parse_mode="Markdown")
-    set_active_message(q.message.chat_id, q.message.message_id, "list", bot=ctx.bot)
 
 
 async def cb_refresh_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Manual refresh — user-initiated only."""
     await cb_back_to_tasks(update, ctx)
 
 
@@ -1004,14 +984,12 @@ async def cb_start_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, task_detail_text(t),
                         reply_markup=task_detail_kb(tid, t.get("status", "idle")),
                         parse_mode="Markdown")
-        set_active_message(q.message.chat_id, q.message.message_id, "detail", tid=tid, bot=ctx.bot)
         return
     update_task(tid, status="idle", error=None, current_step="Starting...")
     running_tasks[tid] = asyncio.create_task(run_task(ctx.bot, tid))
     tasks = load_tasks()
     await safe_edit(q, task_list_text(tasks), reply_markup=task_list_kb(tasks),
                     parse_mode="Markdown")
-    set_active_message(q.message.chat_id, q.message.message_id, "list", bot=ctx.bot)
 
 
 async def cb_pause_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1030,7 +1008,6 @@ async def cb_pause_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, task_detail_text(t),
                         reply_markup=task_detail_kb(tid, t.get("status", "paused")),
                         parse_mode="Markdown")
-        set_active_message(q.message.chat_id, q.message.message_id, "detail", tid=tid, bot=ctx.bot)
 
 
 async def cb_delete_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1053,7 +1030,6 @@ async def cb_delete_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tasks = load_tasks()
     await safe_edit(q, task_list_text(tasks), reply_markup=task_list_kb(tasks),
                     parse_mode="Markdown")
-    set_active_message(q.message.chat_id, q.message.message_id, "list", bot=ctx.bot)
 
 
 # ============================================================
@@ -1075,10 +1051,13 @@ async def conv_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await deny_message(update)
             return ConversationHandler.END
         target_msg = update.message
-    await target_msg.reply_text(
-        "📝 *Step 1/3 — Cookie*\n\nSend me your Facebook cookie string:\n"
-        "`c_user=...; xs=...; datr=...`\n\nSend /cancel to abort.",
-        parse_mode="Markdown")
+    try:
+        await target_msg.reply_text(
+            "📝 *Step 1/3 — Cookie*\n\nSend me your Facebook cookie string:\n"
+            "`c_user=...; xs=...; datr=...`\n\nSend /cancel to abort.",
+            parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"conv_entry error: {e}")
     return ASK_COOKIE
 
 
@@ -1094,8 +1073,8 @@ async def conv_got_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ASK_COOKIE
     ctx.user_data["cookie"] = text
     await update.message.reply_text(
-        "📝 *Step 2/3 — Pages*\n\nHow many pages do you want to create?\n"
-        "Send a number between `1` and `100`.", parse_mode="Markdown")
+        "📝 *Step 2/3 — Pages*\n\nHow many pages?\nSend a number `1`-`100`.",
+        parse_mode="Markdown")
     return ASK_COUNT
 
 
@@ -1112,10 +1091,9 @@ async def conv_got_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ASK_COUNT
     ctx.user_data["count"] = n
     await update.message.reply_text(
-        "📝 *Step 3/3 — Interval*\n\nHow long to wait between pages?\n"
+        "📝 *Step 3/3 — Interval*\n\nHow long between pages?\n"
         "Examples: `10m`, `15m`, `20m`, `1h`, or just `10`.\n\n"
-        "⚠️ FB blocks fast creation. Minimum 5m recommended.",
-        parse_mode="Markdown")
+        "⚠️ Minimum 5m recommended.", parse_mode="Markdown")
     return ASK_INTERVAL
 
 
@@ -1169,9 +1147,8 @@ async def conv_got_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     running_tasks[tid] = asyncio.create_task(run_task(ctx.bot, tid))
 
     tasks = load_tasks()
-    msg = await update.message.reply_text(
+    await update.message.reply_text(
         task_list_text(tasks), reply_markup=task_list_kb(tasks), parse_mode="Markdown")
-    set_active_message(chat_id, msg.message_id, "list", bot=ctx.bot)
     return ConversationHandler.END
 
 
@@ -1198,7 +1175,7 @@ async def edit_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(
         f"✏️ *Editing:* {t.get('name')}\n\nCurrent:\n"
         f"• Interval: `{t.get('interval_min')} min`\n"
-        f"• Target:   `{t.get('target')} pages`\n\nWhat do you want to change?",
+        f"• Target:   `{t.get('target')} pages`",
         reply_markup=kb, parse_mode="Markdown")
     return EDIT_CHOICE
 
@@ -1213,7 +1190,7 @@ async def edit_choose_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     await q.edit_message_text(
-        "⏱️ Send the *new interval* (e.g. `10m`, `30m`, `1h`).\n\nSend /cancel to abort.",
+        "⏱️ Send the *new interval* (e.g. `10m`, `30m`, `1h`).\n\n/cancel to abort.",
         parse_mode="Markdown")
     return EDIT_INTERVAL
 
@@ -1228,7 +1205,7 @@ async def edit_choose_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     await q.edit_message_text(
-        "🎯 Send the *new target* (pages count, 1-100).\n\nSend /cancel to abort.",
+        "🎯 Send the *new target* (1-100).\n\n/cancel to abort.",
         parse_mode="Markdown")
     return EDIT_TARGET
 
@@ -1265,8 +1242,8 @@ async def edit_apply_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     update_task(tid, interval_min=mins)
     t = get_task(tid)
     await update.message.reply_text(
-        f"✅ Interval updated to *{mins} min* for _{t.get('name')}_.\n"
-        f"Takes effect on the next cycle.", parse_mode="Markdown")
+        f"✅ Interval updated to *{mins} min* for _{t.get('name')}_.",
+        parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -1292,8 +1269,7 @@ async def edit_apply_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return EDIT_TARGET
     update_task(tid, target=n)
     await update.message.reply_text(
-        f"✅ Target updated to *{n} pages* for _{t.get('name')}_.",
-        parse_mode="Markdown")
+        f"✅ Target updated to *{n} pages*.", parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -1306,17 +1282,47 @@ async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+#  GLOBAL ERROR HANDLER
+# ============================================================
+async def global_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    err = ctx.error
+    if isinstance(err, Conflict):
+        logger.warning("⚠️ Conflict: another bot instance is running. Retrying...")
+        return
+    if isinstance(err, RetryAfter):
+        logger.warning(f"⚠️ Rate limited. Waiting {err.retry_after}s")
+        await asyncio.sleep(err.retry_after + 1)
+        return
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning(f"⚠️ Network: {err}")
+        return
+    logger.error(f"Unhandled exception: {err}", exc_info=err)
+
+
+# ============================================================
+#  POST-INIT (verify Playwright)
+# ============================================================
+async def post_init(app: Application):
+    await check_playwright()
+
+
+# ============================================================
 #  MAIN
 # ============================================================
 def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set in environment variables!")
+        logger.error("BOT_TOKEN not set!")
         sys.exit(1)
     if not ALLOWED_USER_ID:
-        logger.error("ALLOWED_USER_ID is not set in environment variables!")
+        logger.error("ALLOWED_USER_ID not set!")
         sys.exit(1)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     conv = ConversationHandler(
         entry_points=[
@@ -1338,6 +1344,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
         allow_reentry=True,
+        per_message=True,   # ← fixes PTBUserWarning
     )
 
     app.add_handler(CommandHandler("add", cmd_add))
@@ -1345,6 +1352,7 @@ def main():
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("headless", cmd_headless))
+    app.add_handler(CommandHandler("debug", cmd_debug))
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
@@ -1357,13 +1365,16 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pause_task, pattern="^pause:"))
     app.add_handler(CallbackQueryHandler(cb_delete_task, pattern="^delete:"))
 
+    app.add_error_handler(global_error_handler)
+
     logger.info(f"🤖 Bot running... HEADLESS={HEADLESS}")
     logger.info(f"🔒 Max concurrent browsers: {MAX_CONCURRENT_BROWSERS}")
     logger.info(f"👑 Admin ID: {ALLOWED_USER_ID}")
     logger.info(f"📂 Storage: {TASKS_FILE} | {USERS_FILE}")
     logger.info(f"👥 Users: {len(load_users())} authorized")
-    
-    app.run_polling()
+
+    # drop_pending_updates → clears 409 conflict leftovers
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
