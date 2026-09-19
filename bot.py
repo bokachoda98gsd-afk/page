@@ -28,8 +28,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-# Silence noisy httpx logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("playwright").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -37,19 +37,55 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", 0))
 
 # ============================================================
-#  HEADLESS MODE
+#  PROXY SUPPORT  ⭐ REQUIRED FOR RAILWAY
+#  Set PROXY_URL in Railway env vars.
+#  Formats accepted:
+#    http://user:pass@ip:port
+#    socks5://user:pass@ip:port
+#    ip:port
+# ============================================================
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+PROXY_USER = os.getenv("PROXY_USER", "").strip()
+PROXY_PASS = os.getenv("PROXY_PASS", "").strip()
+
+
+def get_proxy_config():
+    """Return Playwright proxy dict or None."""
+    if not PROXY_URL:
+        return None
+    url = PROXY_URL
+    # If user provided "ip:port" style, assume http
+    if not url.startswith(("http://", "https://", "socks5://", "socks4://")):
+        url = f"http://{url}"
+    # Strip embedded credentials (Playwright wants them separately)
+    if "@" in url:
+        scheme_rest = url.split("://", 1)
+        scheme = scheme_rest[0]
+        rest = scheme_rest[1]
+        creds, host = rest.split("@", 1)
+        if ":" in creds:
+            user, pwd = creds.split(":", 1)
+            return {"server": f"{scheme}://{host}", "username": user, "password": pwd}
+    cfg = {"server": url}
+    if PROXY_USER:
+        cfg["username"] = PROXY_USER
+    if PROXY_PASS:
+        cfg["password"] = PROXY_PASS
+    return cfg
+
+
+# ============================================================
+#  HEADLESS
 # ============================================================
 HEADLESS = True
 
 # ============================================================
-#  CONCURRENCY LIMIT
-#  Railway starter (1GB) → 1
-#  Railway hobby (2GB)   → 2
+#  CONCURRENCY
 # ============================================================
 MAX_CONCURRENT_BROWSERS = int(os.getenv("MAX_CONCURRENT_BROWSERS", 1))
 
 # ============================================================
-#  CHROMIUM ARGS (VPS/Railway-critical)
+#  CHROMIUM ARGS (Railway-optimized, low-memory)
 # ============================================================
 CHROMIUM_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -59,18 +95,34 @@ CHROMIUM_ARGS = [
     "--disable-dev-shm-usage",
     "--disable-extensions",
     "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-features=TranslateUI,BlinkGenPropertyTrees",
     "--disable-sync",
     "--disable-default-apps",
+    "--disable-component-update",
+    "--disable-client-side-phishing-detection",
     "--mute-audio",
     "--no-first-run",
     "--no-zygote",
-    "--single-process",              # ← critical for Railway low memory
+    "--no-default-browser-check",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--metrics-recording-only",
+    "--single-process",
     "--js-flags=--max-old-space-size=256",
+    "--window-size=1280,800",
+]
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
 # ============================================================
-#  STORAGE PATHS
-#  Set these to /app/data/... when using Railway Volume
+#  STORAGE
 # ============================================================
 DATA_DIR = os.getenv("DATA_DIR", ".")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
@@ -83,7 +135,6 @@ BROWSER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
 
 MAX_MSG = 3800
 MAX_ERR = 300
-
 POST_CREATE_WAIT_MS = 20000
 
 (ASK_COOKIE, ASK_COUNT, ASK_INTERVAL,
@@ -91,20 +142,19 @@ POST_CREATE_WAIT_MS = 20000
 
 
 # ============================================================
-#  STARTUP HEALTH CHECK
+#  PLAYWRIGHT HEALTH CHECK
 # ============================================================
 async def check_playwright():
-    """Verify Playwright can launch Chromium. Logs result."""
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
             version = browser.version
             await browser.close()
             logger.info(f"✅ Playwright OK — Chromium {version}")
-            return True
+            return True, version
     except Exception as e:
         logger.error(f"❌ Playwright FAILED: {e}")
-        return False
+        return False, str(e)
 
 
 # ============================================================
@@ -119,8 +169,7 @@ def load_users() -> set:
         if isinstance(data, list):
             return {int(x) for x in data if str(x).lstrip("-").isdigit()}
         return set()
-    except Exception as e:
-        logger.error(f"Error loading users: {e}")
+    except Exception:
         return set()
 
 
@@ -130,7 +179,7 @@ def save_users(users: set):
         with open(USERS_FILE, "w") as f:
             json.dump(sorted(int(u) for u in users), f, indent=2)
     except Exception as e:
-        logger.error(f"Error saving users: {e}")
+        logger.error(f"save_users: {e}")
 
 
 def is_admin(user_id: int) -> bool:
@@ -157,7 +206,7 @@ def cb_authorized(update: Update) -> bool:
 async def deny_message(update: Update):
     try:
         await update.effective_message.reply_text(
-            "⛔ Access denied.\nThis bot is private. Contact the admin to get access."
+            "⛔ Access denied.\nThis bot is private."
         )
     except Exception:
         pass
@@ -171,9 +220,9 @@ async def deny_callback(update: Update):
 
 
 # ============================================================
-#  SAFE HELPERS
+#  HELPERS
 # ============================================================
-def truncate(s, n: int) -> str:
+def truncate(s, n):
     if s is None:
         return ""
     s = str(s)
@@ -201,7 +250,7 @@ def extract_c_user(cookie_str: str) -> str:
     return ""
 
 
-async def safe_edit(q, text: str, reply_markup=None, parse_mode="Markdown"):
+async def safe_edit(q, text, reply_markup=None, parse_mode="Markdown"):
     text = truncate_msg(text)
     try:
         await q.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -214,7 +263,7 @@ async def safe_edit(q, text: str, reply_markup=None, parse_mode="Markdown"):
             pass
     except Exception as e:
         err = str(e).lower()
-        if any(k in err for k in ["parse", "entit", "bad request", "can't find", "not modified"]):
+        if any(k in err for k in ["parse", "entit", "bad request", "not modified"]):
             return
         try:
             await q.message.reply_text(text, reply_markup=reply_markup)
@@ -229,8 +278,7 @@ async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(
             f"🆔 Your Telegram ID: `{update.effective_user.id}`",
-            parse_mode="Markdown",
-        )
+            parse_mode="Markdown")
     except Exception:
         pass
 
@@ -240,33 +288,16 @@ async def cmd_headless(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update) or not is_admin(update.effective_user.id):
         await deny_message(update)
         return
-
     raw = (update.message.text or "").strip().lower()
-    if "=" in raw:
-        val = raw.split("=", 1)[1].strip()
-    elif ctx.args:
-        val = ctx.args[0].strip().lower()
-    else:
-        val = ""
-
+    val = raw.split("=", 1)[1].strip() if "=" in raw else (ctx.args[0] if ctx.args else "")
     if val in ("true", "1", "on", "yes"):
         HEADLESS = True
-        await update.message.reply_text(
-            "✅ *HEADLESS = True*\nBrowser will run silently.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("✅ HEADLESS = True")
     elif val in ("false", "0", "off", "no"):
         HEADLESS = False
-        await update.message.reply_text(
-            "✅ *HEADLESS = False*\n⚠️ Only works with Xvfb display.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("✅ HEADLESS = False (needs Xvfb)")
     else:
-        await update.message.reply_text(
-            f"ℹ️ Current: *HEADLESS = {HEADLESS}*\n\n"
-            f"`/headless=true` or `/headless=false`",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"HEADLESS = {HEADLESS}")
 
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -282,17 +313,17 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID.")
         return
     if is_admin(new_id):
-        await update.message.reply_text("ℹ️ That ID is the admin.")
+        await update.message.reply_text("ℹ️ That's the admin.")
         return
     users = load_users()
     if new_id in users:
-        await update.message.reply_text(f"ℹ️ `{new_id}` already authorized.", parse_mode="Markdown")
+        await update.message.reply_text(f"ℹ️ Already authorized.")
         return
     users.add(new_id)
     save_users(users)
     await update.message.reply_text(f"✅ Added `{new_id}`.", parse_mode="Markdown")
     try:
-        await ctx.bot.send_message(new_id, "✅ Access granted. Send /start to begin.")
+        await ctx.bot.send_message(new_id, "✅ Access granted. Send /start.")
     except Exception:
         pass
 
@@ -313,16 +344,9 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Cannot remove admin.")
         return
     users = load_users()
-    if rid not in users:
-        await update.message.reply_text(f"ℹ️ `{rid}` not in whitelist.", parse_mode="Markdown")
-        return
     users.discard(rid)
     save_users(users)
     await update.message.reply_text(f"🗑️ Removed `{rid}`.", parse_mode="Markdown")
-    try:
-        await ctx.bot.send_message(rid, "⛔ Your access has been revoked.")
-    except Exception:
-        pass
 
 
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -334,32 +358,71 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not users:
         lines.append("_No additional users._")
     else:
-        lines.append(f"✅ *Authorized users ({len(users)}):*")
+        lines.append(f"✅ *{len(users)} authorized:*")
         for u in sorted(users):
             lines.append(f"• `{u}`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: test Playwright from inside the container."""
+    """Full diagnostics."""
     if not authorized(update) or not is_admin(update.effective_user.id):
         await deny_message(update)
         return
-    await update.message.reply_text("🧪 Testing Playwright...")
-    ok = await check_playwright()
+    await update.message.reply_text("🧪 Running diagnostics...")
+
+    # 1. Playwright test
+    ok, info = await check_playwright()
+    lines = ["🔍 *Diagnostics*", ""]
+
     if ok:
-        await update.message.reply_text("✅ Playwright works!")
+        lines.append(f"✅ Playwright: Chromium `{info}`")
     else:
-        await update.message.reply_text(
-            "❌ Playwright FAILED.\n\nCheck logs. Common causes:\n"
-            "• Dockerfile not based on `mcr.microsoft.com/playwright/python`\n"
-            "• `playwright install chromium` not run during build\n"
-            "• Out of memory"
-        )
+        lines.append(f"❌ Playwright: `{info[:150]}`")
+
+    # 2. Proxy status
+    proxy = get_proxy_config()
+    if proxy:
+        lines.append(f"✅ Proxy: `{proxy['server']}`")
+    else:
+        lines.append("⚠️ *No proxy set* — FB will likely block Railway's IP.")
+        lines.append("Set `PROXY_URL` in Railway env vars.")
+
+    # 3. Memory / storage
+    lines.append(f"📂 Data dir: `{DATA_DIR}`")
+    lines.append(f"🔒 Max browsers: `{MAX_CONCURRENT_BROWSERS}`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    # 4. Live browser test (navigate to FB)
+    await update.message.reply_text("🌐 Testing Facebook reachability...")
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+            ctx_p = await browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                viewport={"width": 1280, "height": 800},
+            )
+            page = await ctx_p.new_page()
+            await page.goto("https://www.facebook.com/",
+                            wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            url = page.url
+            title = await page.title()
+            shot = os.path.join(SCREENSHOT_DIR, f"debug_{int(datetime.now().timestamp())}.png")
+            await page.screenshot(path=shot)
+            await browser.close()
+            await update.message.reply_text(
+                f"📍 Final URL: `{url}`\n📄 Title: `{title}`\n\n"
+                f"📸 Screenshot saved on server.",
+                parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ FB test failed:\n`{sanitize_error(e)}`",
+                                        parse_mode="Markdown")
 
 
 # ============================================================
-#  STORAGE
+#  STORAGE (tasks)
 # ============================================================
 def load_tasks() -> dict:
     if not Path(TASKS_FILE).exists():
@@ -367,8 +430,7 @@ def load_tasks() -> dict:
     try:
         with open(TASKS_FILE, "r") as f:
             return json.load(f)
-    except Exception as e:
-        logger.error(f"Error loading tasks: {e}")
+    except Exception:
         return {}
 
 
@@ -378,28 +440,28 @@ def save_tasks(tasks: dict):
         with open(TASKS_FILE, "w") as f:
             json.dump(tasks, f, indent=2)
     except Exception as e:
-        logger.error(f"Error saving tasks: {e}")
+        logger.error(f"save_tasks: {e}")
 
 
-def get_task(tid: str):
+def get_task(tid):
     return load_tasks().get(tid)
 
 
-def update_task(tid: str, **kwargs):
+def update_task(tid, **kwargs):
     tasks = load_tasks()
     if tid in tasks:
         tasks[tid].update(kwargs)
         save_tasks(tasks)
 
 
-def delete_task(tid: str):
+def delete_task(tid):
     tasks = load_tasks()
     tasks.pop(tid, None)
     save_tasks(tasks)
 
 
 # ============================================================
-#  MISC
+#  COOKIES / NAME
 # ============================================================
 def parse_cookies(cookie_str: str):
     cookies = []
@@ -432,7 +494,7 @@ STATUS_ICON = {"idle": "⚪", "running": "🟢", "paused": "⏸️",
                "completed": "✅", "failed": "❌"}
 
 
-def humanize_remaining(seconds: int) -> str:
+def humanize_remaining(seconds):
     if seconds <= 0:
         return "starting..."
     h = seconds // 3600
@@ -446,7 +508,7 @@ def humanize_remaining(seconds: int) -> str:
 
 
 # ============================================================
-#  CATEGORY SELECTION
+#  CATEGORY
 # ============================================================
 async def is_category_valid(page, input_loc) -> bool:
     try:
@@ -473,14 +535,12 @@ async def fill_category(page, input_loc, category_text="Entertainment", max_retr
             except Exception:
                 await input_loc.click(force=True, timeout=4000)
             await page.wait_for_timeout(500)
-
             try:
                 await input_loc.fill("")
             except Exception:
                 await input_loc.press("Control+A")
                 await input_loc.press("Delete")
             await page.wait_for_timeout(400)
-
             await input_loc.focus()
             await page.wait_for_timeout(200)
             await input_loc.type(category_text, delay=140)
@@ -534,10 +594,11 @@ async def fill_category(page, input_loc, category_text="Entertainment", max_retr
 
 
 # ============================================================
-#  CREATE ONE PAGE
+#  CREATE ONE PAGE  (with detailed step logging + proxy)
 # ============================================================
-async def create_one_page(cookie: str, log=None, tid: str = "unknown"):
+async def create_one_page(cookie: str, log=None, tid="unknown"):
     async def note(msg):
+        logger.info(f"[{tid}] {msg}")
         if log:
             try:
                 await log(msg)
@@ -545,36 +606,60 @@ async def create_one_page(cookie: str, log=None, tid: str = "unknown"):
                 pass
 
     page_name = random_page_name()
+    proxy = get_proxy_config()
+    if proxy:
+        await note(f"🌐 Using proxy: {proxy['server']}")
+    else:
+        await note("⚠️ No proxy — datacenter IP may be blocked")
 
     async with BROWSER_SEMAPHORE:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=HEADLESS,
-                slow_mo=250 if not HEADLESS else 0,
-                args=CHROMIUM_ARGS,
-            )
+            await note("🚀 Launching Chromium...")
+            try:
+                browser = await p.chromium.launch(
+                    headless=HEADLESS,
+                    slow_mo=0,
+                    args=CHROMIUM_ARGS,
+                    proxy=proxy,
+                )
+            except Exception as e:
+                await note(f"❌ Launch failed: {sanitize_error(e)}")
+                raise
+
             page = None
+            context = None
             try:
                 context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1366, "height": 850},
+                    user_agent=random.choice(USER_AGENTS),
+                    viewport={"width": 1280, "height": 800},
                     locale="en-US",
+                    timezone_id="America/New_York",
+                    extra_http_headers={
+                        "Accept-Language": "en-US,en;q=0.9",
+                    },
                 )
                 await context.add_cookies(parse_cookies(cookie))
                 page = await context.new_page()
                 page.set_default_timeout(30000)
 
-                # 1. LOGIN
+                # 1. LOGIN CHECK
                 await note("🌐 Loading facebook.com...")
-                await page.goto("https://www.facebook.com/",
-                                wait_until="domcontentloaded", timeout=60000)
+                try:
+                    await page.goto("https://www.facebook.com/",
+                                    wait_until="domcontentloaded", timeout=60000)
+                except PWTimeout:
+                    raise RuntimeError("Timeout loading facebook.com (proxy slow or blocked)")
                 await page.wait_for_timeout(4000)
-                if "/login" in page.url or "checkpoint" in page.url:
-                    raise RuntimeError("Cookie expired or checkpoint required.")
+
+                current_url = page.url
+                await note(f"📍 URL after load: {current_url[:80]}")
+
+                if "/login" in current_url:
+                    raise RuntimeError("COOKIE EXPIRED (redirected to /login)")
+                if "checkpoint" in current_url:
+                    raise RuntimeError("CHECKPOINT required (FB flagged this session/IP)")
+                if "captcha" in current_url.lower():
+                    raise RuntimeError("CAPTCHA challenge (FB flagged this IP)")
 
                 # 2. PAGES HOME
                 await note("📄 Opening Pages...")
@@ -583,6 +668,9 @@ async def create_one_page(cookie: str, log=None, tid: str = "unknown"):
                     wait_until="domcontentloaded", timeout=60000,
                 )
                 await page.wait_for_timeout(4000)
+
+                if "/login" in page.url or "checkpoint" in page.url:
+                    raise RuntimeError(f"Redirected after Pages: {page.url[:60]}")
 
                 # 3. CREATE PAGE
                 await note("🖱️ Clicking Create Page...")
@@ -625,7 +713,7 @@ async def create_one_page(cookie: str, log=None, tid: str = "unknown"):
                 await page.wait_for_timeout(1000)
 
                 # 8. CATEGORY
-                await note("🔍 Category...")
+                await note("🔍 Category: Entertainment...")
                 cat_input = page.locator('input[aria-label="Category (required)"]').first
                 await cat_input.wait_for(state="attached", timeout=20000)
                 if not await fill_category(page, cat_input, "Entertainment", max_retries=3):
@@ -656,17 +744,28 @@ async def create_one_page(cookie: str, log=None, tid: str = "unknown"):
                 return {"name": page_name, "url": final_url, "success": True}
 
             except Exception as e:
-                # Save debug screenshot
+                # Debug screenshot on failure
                 try:
                     if page:
-                        shot = os.path.join(SCREENSHOT_DIR, f"{tid}_{int(datetime.now().timestamp())}.png")
+                        shot = os.path.join(
+                            SCREENSHOT_DIR,
+                            f"{tid}_{int(datetime.now().timestamp())}.png"
+                        )
                         await page.screenshot(path=shot, full_page=True)
-                        logger.error(f"Screenshot saved: {shot}")
+                        logger.error(f"📸 Screenshot: {shot}")
                 except Exception:
                     pass
                 raise
             finally:
-                await browser.close()
+                try:
+                    if context:
+                        await context.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
 
 # ============================================================
@@ -696,8 +795,7 @@ async def run_task(bot, tid: str):
                     await bot.send_message(
                         chat_id,
                         f"🎉 *{t.get('name')}* completed — {t.get('target')} pages.",
-                        parse_mode="Markdown",
-                    )
+                        parse_mode="Markdown")
                 except Exception:
                     pass
                 return
@@ -717,8 +815,7 @@ async def run_task(bot, tid: str):
                         chat_id,
                         f"💥 *{t.get('name')}* failed:\n`{err}`\n\n"
                         f"Tap 📋 Task → select to retry, edit, or delete.",
-                        parse_mode="Markdown",
-                    )
+                        parse_mode="Markdown")
                 except Exception:
                     pass
                 return
@@ -745,8 +842,7 @@ async def run_task(bot, tid: str):
                     chat_id,
                     f"✅ Page {t2['created']}/{t2['target']} created!\n"
                     f"👤 user : {user_id}\n"
-                    f"📛 {result['name']}",
-                )
+                    f"📛 {result['name']}")
             except Exception:
                 pass
 
@@ -756,8 +852,7 @@ async def run_task(bot, tid: str):
                     await bot.send_message(
                         chat_id,
                         f"🎉 *{t2['name']}* completed — all {t2['target']} pages done!",
-                        parse_mode="Markdown",
-                    )
+                        parse_mode="Markdown")
                 except Exception:
                     pass
                 return
@@ -802,7 +897,7 @@ def main_menu_kb():
     return ReplyKeyboardMarkup([[KeyboardButton("📋 Task")]], resize_keyboard=True)
 
 
-def task_list_kb(tasks: dict) -> InlineKeyboardMarkup:
+def task_list_kb(tasks):
     rows = []
     for tid, t in tasks.items():
         icon = STATUS_ICON.get(t.get("status", "idle"), "⚪")
@@ -814,7 +909,7 @@ def task_list_kb(tasks: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def task_detail_kb(tid: str, status: str) -> InlineKeyboardMarkup:
+def task_detail_kb(tid, status):
     rows = []
     if status in ("idle", "failed", "paused"):
         rows.append([InlineKeyboardButton("▶️ Start", callback_data=f"start:{tid}")])
@@ -822,14 +917,14 @@ def task_detail_kb(tid: str, status: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("⏸️ Pause", callback_data=f"pause:{tid}")])
     rows.append([InlineKeyboardButton("✏️ Edit Config", callback_data=f"edit:{tid}")])
     rows.append([InlineKeyboardButton("🗑️ Delete", callback_data=f"delete:{tid}")])
-    rows.append([InlineKeyboardButton("⬅️ Back to Tasks", callback_data="back_to_tasks")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_tasks")])
     return InlineKeyboardMarkup(rows)
 
 
-def task_list_text(tasks: dict) -> str:
+def task_list_text(tasks):
     try:
         if not tasks:
-            return "📋 *Your Tasks*\n\n_No tasks yet. Tap below to create one._"
+            return "📋 *Your Tasks*\n\n_No tasks yet._"
         lines = [f"📋 *Your Tasks* — {len(tasks)} total", ""]
         for tid, t in tasks.items():
             icon = STATUS_ICON.get(t.get("status", "idle"), "⚪")
@@ -857,7 +952,7 @@ def task_list_text(tasks: dict) -> str:
         return f"📋 *Your Tasks*\n\n_Error: {sanitize_error(e)}_"
 
 
-def task_detail_text(t: dict) -> str:
+def task_detail_text(t):
     try:
         icon = STATUS_ICON.get(t.get("status", "idle"), "⚪")
         uid = t.get("user_id") or extract_c_user(t.get("cookie", "")) or "?"
@@ -892,7 +987,7 @@ def task_detail_text(t: dict) -> str:
                 lines.append(f"• {sanitize_error(h.get('name', '?'))}")
         return truncate_msg("\n".join(lines))
     except Exception as e:
-        return f"⚠️ Could not render task.\n\nError: {sanitize_error(e)}"
+        return f"⚠️ Render error: {sanitize_error(e)}"
 
 
 # ============================================================
@@ -905,8 +1000,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to *FB Page Creator Bot*\n\n"
         "Tap *📋 Task* below to manage your tasks.",
-        reply_markup=main_menu_kb(), parse_mode="Markdown",
-    )
+        reply_markup=main_menu_kb(), parse_mode="Markdown")
 
 
 async def show_task_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -914,11 +1008,8 @@ async def show_task_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await deny_message(update)
         return
     tasks = load_tasks()
-    msg = await update.message.reply_text(
-        task_list_text(tasks), reply_markup=task_list_kb(tasks), parse_mode="Markdown",
-    )
-    # Store msg_id for manual refresh
-    ctx.chat_data["last_msg_id"] = msg.message_id
+    await update.message.reply_text(
+        task_list_text(tasks), reply_markup=task_list_kb(tasks), parse_mode="Markdown")
 
 
 async def cb_show_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -962,7 +1053,6 @@ async def cb_back_to_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cb_refresh_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Manual refresh — user-initiated only."""
     await cb_back_to_tasks(update, ctx)
 
 
@@ -1053,11 +1143,11 @@ async def conv_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target_msg = update.message
     try:
         await target_msg.reply_text(
-            "📝 *Step 1/3 — Cookie*\n\nSend me your Facebook cookie string:\n"
-            "`c_user=...; xs=...; datr=...`\n\nSend /cancel to abort.",
+            "📝 *Step 1/3 — Cookie*\n\nSend your Facebook cookie:\n"
+            "`c_user=...; xs=...; datr=...`\n\n/cancel to abort.",
             parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"conv_entry error: {e}")
+        logger.error(f"conv_entry: {e}")
     return ASK_COOKIE
 
 
@@ -1068,13 +1158,11 @@ async def conv_got_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if "c_user=" not in text or "xs=" not in text:
         await update.message.reply_text(
-            "❌ Invalid. Must contain `c_user=` and `xs=`. Try again or /cancel.",
-            parse_mode="Markdown")
+            "❌ Invalid. Must contain `c_user=` and `xs=`.", parse_mode="Markdown")
         return ASK_COOKIE
     ctx.user_data["cookie"] = text
     await update.message.reply_text(
-        "📝 *Step 2/3 — Pages*\n\nHow many pages?\nSend a number `1`-`100`.",
-        parse_mode="Markdown")
+        "📝 *Step 2/3 — Pages*\n\nHow many pages? (1-100)", parse_mode="Markdown")
     return ASK_COUNT
 
 
@@ -1087,17 +1175,17 @@ async def conv_got_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not (1 <= n <= 100):
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Send a number between 1 and 100.")
+        await update.message.reply_text("❌ Send a number 1-100.")
         return ASK_COUNT
     ctx.user_data["count"] = n
     await update.message.reply_text(
         "📝 *Step 3/3 — Interval*\n\nHow long between pages?\n"
-        "Examples: `10m`, `15m`, `20m`, `1h`, or just `10`.\n\n"
+        "Examples: `10m`, `15m`, `1h`, or `10`.\n\n"
         "⚠️ Minimum 5m recommended.", parse_mode="Markdown")
     return ASK_INTERVAL
 
 
-def parse_interval(raw: str):
+def parse_interval(raw):
     raw = raw.strip().lower()
     if raw.endswith("h"):
         return int(float(raw[:-1]) * 60)
@@ -1116,7 +1204,7 @@ async def conv_got_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "❌ Invalid. Use e.g. `10m`, `1h`, or `10`.", parse_mode="Markdown")
+            "❌ Invalid. Use `10m`, `1h`, or `10`.", parse_mode="Markdown")
         return ASK_INTERVAL
 
     cookie = ctx.user_data["cookie"]
@@ -1169,11 +1257,11 @@ async def edit_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["edit_tid"] = tid
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏱️ Edit Interval", callback_data="edit_field:interval")],
-        [InlineKeyboardButton("🎯 Edit Target Pages", callback_data="edit_field:target")],
+        [InlineKeyboardButton("🎯 Edit Target", callback_data="edit_field:target")],
         [InlineKeyboardButton("❌ Cancel", callback_data="edit_field:cancel")],
     ])
     await q.message.reply_text(
-        f"✏️ *Editing:* {t.get('name')}\n\nCurrent:\n"
+        f"✏️ *Editing:* {t.get('name')}\n\n"
         f"• Interval: `{t.get('interval_min')} min`\n"
         f"• Target:   `{t.get('target')} pages`",
         reply_markup=kb, parse_mode="Markdown")
@@ -1189,9 +1277,7 @@ async def edit_choose_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer()
     except Exception:
         pass
-    await q.edit_message_text(
-        "⏱️ Send the *new interval* (e.g. `10m`, `30m`, `1h`).\n\n/cancel to abort.",
-        parse_mode="Markdown")
+    await q.edit_message_text("⏱️ Send new interval (e.g. `10m`, `1h`).", parse_mode="Markdown")
     return EDIT_INTERVAL
 
 
@@ -1204,9 +1290,7 @@ async def edit_choose_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer()
     except Exception:
         pass
-    await q.edit_message_text(
-        "🎯 Send the *new target* (1-100).\n\n/cancel to abort.",
-        parse_mode="Markdown")
+    await q.edit_message_text("🎯 Send new target (1-100).", parse_mode="Markdown")
     return EDIT_TARGET
 
 
@@ -1219,7 +1303,7 @@ async def edit_cancel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer()
     except Exception:
         pass
-    await q.edit_message_text("❌ Edit cancelled.")
+    await q.edit_message_text("❌ Cancelled.")
     return ConversationHandler.END
 
 
@@ -1229,21 +1313,19 @@ async def edit_apply_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     tid = ctx.user_data.get("edit_tid")
     if not tid:
-        await update.message.reply_text("⚠️ No task selected.")
+        await update.message.reply_text("⚠️ No task.")
         return ConversationHandler.END
     try:
         mins = parse_interval(update.message.text)
         if mins < 1 or mins > 24 * 60:
             raise ValueError
     except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid. Use e.g. `10m` or `1h`.", parse_mode="Markdown")
+        await update.message.reply_text("❌ Invalid. Use `10m` or `1h`.", parse_mode="Markdown")
         return EDIT_INTERVAL
     update_task(tid, interval_min=mins)
     t = get_task(tid)
     await update.message.reply_text(
-        f"✅ Interval updated to *{mins} min* for _{t.get('name')}_.",
-        parse_mode="Markdown")
+        f"✅ Interval → *{mins} min* for _{t.get('name')}_.", parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -1253,23 +1335,22 @@ async def edit_apply_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     tid = ctx.user_data.get("edit_tid")
     if not tid:
-        await update.message.reply_text("⚠️ No task selected.")
+        await update.message.reply_text("⚠️ No task.")
         return ConversationHandler.END
     try:
         n = int(update.message.text.strip())
         if not (1 <= n <= 100):
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Send a number between 1 and 100.")
+        await update.message.reply_text("❌ Send 1-100.")
         return EDIT_TARGET
     t = get_task(tid)
     if n < t.get("created", 0):
         await update.message.reply_text(
-            f"❌ Target must be ≥ already-created count ({t.get('created', 0)}).")
+            f"❌ Target ≥ {t.get('created', 0)} (already created).")
         return EDIT_TARGET
     update_task(tid, target=n)
-    await update.message.reply_text(
-        f"✅ Target updated to *{n} pages*.", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Target → *{n} pages*.", parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -1284,10 +1365,11 @@ async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 #  GLOBAL ERROR HANDLER
 # ============================================================
-async def global_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+async def global_error_handler(update, ctx: ContextTypes.DEFAULT_TYPE):
     err = ctx.error
     if isinstance(err, Conflict):
-        logger.warning("⚠️ Conflict: another bot instance is running. Retrying...")
+        logger.warning("⚠️ Conflict: another bot instance. Retry in 5s...")
+        await asyncio.sleep(5)
         return
     if isinstance(err, RetryAfter):
         logger.warning(f"⚠️ Rate limited. Waiting {err.retry_after}s")
@@ -1296,14 +1378,32 @@ async def global_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     if isinstance(err, (TimedOut, NetworkError)):
         logger.warning(f"⚠️ Network: {err}")
         return
-    logger.error(f"Unhandled exception: {err}", exc_info=err)
+    logger.error(f"Unhandled: {err}", exc_info=err)
 
 
 # ============================================================
-#  POST-INIT (verify Playwright)
+#  POST INIT
 # ============================================================
 async def post_init(app: Application):
-    await check_playwright()
+    logger.info("=" * 60)
+    logger.info("🚀 STARTUP DIAGNOSTICS")
+    logger.info(f"   DATA_DIR   : {DATA_DIR}")
+    logger.info(f"   TASKS_FILE : {TASKS_FILE}")
+    logger.info(f"   USERS_FILE : {USERS_FILE}")
+    logger.info(f"   HEADLESS   : {HEADLESS}")
+    logger.info(f"   MAX_BROWSERS: {MAX_CONCURRENT_BROWSERS}")
+    if PROXY_URL:
+        logger.info(f"   PROXY      : {PROXY_URL.split('@')[-1]}")
+    else:
+        logger.warning("   PROXY      : ❌ NOT SET (FB may block Railway IP)")
+    logger.info("=" * 60)
+
+    # Verify Playwright
+    ok, info = await check_playwright()
+    if not ok:
+        logger.error("❌ Playwright unavailable. Tasks will fail!")
+        logger.error(f"   Error: {info}")
+    logger.info("=" * 60)
 
 
 # ============================================================
@@ -1344,7 +1444,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
         allow_reentry=True,
-        per_message=True,   # ← fixes PTBUserWarning
+        per_message=True,
     )
 
     app.add_handler(CommandHandler("add", cmd_add))
@@ -1367,13 +1467,8 @@ def main():
 
     app.add_error_handler(global_error_handler)
 
-    logger.info(f"🤖 Bot running... HEADLESS={HEADLESS}")
-    logger.info(f"🔒 Max concurrent browsers: {MAX_CONCURRENT_BROWSERS}")
-    logger.info(f"👑 Admin ID: {ALLOWED_USER_ID}")
-    logger.info(f"📂 Storage: {TASKS_FILE} | {USERS_FILE}")
-    logger.info(f"👥 Users: {len(load_users())} authorized")
+    logger.info(f"🤖 Bot running... Admin: {ALLOWED_USER_ID}")
 
-    # drop_pending_updates → clears 409 conflict leftovers
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
