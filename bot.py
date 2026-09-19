@@ -4,6 +4,8 @@ import json
 import uuid
 import random
 import asyncio
+import logging
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -18,35 +20,70 @@ from telegram.ext import (
 )
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+# ============================================================
+#  LOGGING SETUP (For Railway Logs)
+# ============================================================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID"))   # ← admin
+ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", 0))   # admin
 
 # ============================================================
-#  TOGGLE: True = silent (production)
+#  HEADLESS MODE (toggle at runtime with /headless=true|false)
 # ============================================================
 HEADLESS = True
 
-TASKS_FILE = "tasks.json"
-USERS_FILE = "users.json"
+# ============================================================
+#  CONCURRENCY LIMIT (VPS safety)
+# ============================================================
+MAX_CONCURRENT_BROWSERS = 3
+
+# ============================================================
+#  CHROMIUM ARGS (VPS-critical)
+# ============================================================
+CHROMIUM_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-gpu",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--mute-audio",
+    "--no-first-run",
+    "--no-zygote",
+    "--js-flags=--max-old-space-size=256",
+]
+
+# Use absolute paths for Railway Volumes if needed, otherwise relative
+TASKS_FILE = os.getenv("TASKS_FILE", "tasks.json")
+USERS_FILE = os.getenv("USERS_FILE", "users.json")
 
 running_tasks = {}
 active_message = {}
 auto_refresh_task = {}
+BROWSER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
 
 MAX_MSG = 3800
 MAX_ERR = 300
 REFRESH_INTERVAL = 8
 REFRESH_MAX_AGE = 30 * 60
 
-POST_CREATE_WAIT_MS = 15000
+POST_CREATE_WAIT_MS = 20000   # ← 20 seconds
 
 (ASK_COOKIE, ASK_COUNT, ASK_INTERVAL,
  EDIT_CHOICE, EDIT_INTERVAL, EDIT_TARGET) = range(6)
 
 
 # ============================================================
-#  USER WHITELIST (admin access control)
+#  USER WHITELIST
 # ============================================================
 def load_users() -> set:
     if not Path(USERS_FILE).exists():
@@ -57,13 +94,17 @@ def load_users() -> set:
         if isinstance(data, list):
             return {int(x) for x in data if str(x).lstrip("-").isdigit()}
         return set()
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error loading users: {e}")
         return set()
 
 
 def save_users(users: set):
-    with open(USERS_FILE, "w") as f:
-        json.dump(sorted(int(u) for u in users), f, indent=2)
+    try:
+        with open(USERS_FILE, "w") as f:
+            json.dump(sorted(int(u) for u in users), f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving users: {e}")
 
 
 def is_admin(user_id: int) -> bool:
@@ -79,22 +120,18 @@ def is_authorized(user_id: int) -> bool:
 
 
 def authorized(update: Update) -> bool:
-    """Used by message-based handlers."""
     return bool(update.effective_user and is_authorized(update.effective_user.id))
 
 
 def cb_authorized(update: Update) -> bool:
-    """Used by callback-query handlers."""
     q = update.callback_query
     return bool(q and q.from_user and is_authorized(q.from_user.id))
 
 
 async def deny_message(update: Update):
-    """Reply to a non-authorized user politely."""
     try:
         await update.effective_message.reply_text(
-            "⛔ Access denied.\n"
-            "This bot is private. Contact the admin to get access."
+            "⛔ Access denied.\nThis bot is private. Contact the admin to get access."
         )
     except Exception:
         pass
@@ -161,7 +198,6 @@ async def safe_edit(q, text: str, reply_markup=None, parse_mode="Markdown"):
 #  ADMIN COMMANDS
 # ============================================================
 async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Anyone can see their own ID (needed to request access)."""
     try:
         await update.message.reply_text(
             f"🆔 Your Telegram ID: `{update.effective_user.id}`",
@@ -169,6 +205,41 @@ async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass
+
+
+async def cmd_headless(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global HEADLESS
+    if not authorized(update) or not is_admin(update.effective_user.id):
+        await deny_message(update)
+        return
+
+    raw = (update.message.text or "").strip().lower()
+    if "=" in raw:
+        val = raw.split("=", 1)[1].strip()
+    elif ctx.args:
+        val = ctx.args[0].strip().lower()
+    else:
+        val = ""
+
+    if val in ("true", "1", "on", "yes"):
+        HEADLESS = True
+        await update.message.reply_text(
+            "✅ *HEADLESS = True*\nBrowser will run silently (production mode).",
+            parse_mode="Markdown",
+        )
+    elif val in ("false", "0", "off", "no"):
+        HEADLESS = False
+        await update.message.reply_text(
+            "✅ *HEADLESS = False*\nBrowser will run visible on VPS screen (debug mode).\n"
+            "⚠️ Requires a display (Xvfb) on VPS.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"ℹ️ Current: *HEADLESS = {HEADLESS}*\n\n"
+            f"Usage:\n`/headless=true` → silent\n`/headless=false` → visible (debug)",
+            parse_mode="Markdown",
+        )
 
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -195,7 +266,6 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Added `{new_id}` to the whitelist.", parse_mode="Markdown"
     )
-    # Notify the new user (best effort)
     try:
         await ctx.bot.send_message(
             new_id,
@@ -305,7 +375,7 @@ async def _auto_refresh_worker(bot, chat_id):
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"[refresh] {e}")
+        logger.error(f"[refresh] {e}")
     finally:
         auto_refresh_task.pop(chat_id, None)
 
@@ -329,13 +399,17 @@ def load_tasks() -> dict:
     try:
         with open(TASKS_FILE, "r") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error loading tasks: {e}")
         return {}
 
 
 def save_tasks(tasks: dict):
-    with open(TASKS_FILE, "w") as f:
-        json.dump(tasks, f, indent=2)
+    try:
+        with open(TASKS_FILE, "w") as f:
+            json.dump(tasks, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving tasks: {e}")
 
 
 def get_task(tid: str):
@@ -485,13 +559,13 @@ async def fill_category(page, input_loc, category_text="Entertainment", max_retr
 
             await page.wait_for_timeout(800)
         except Exception as e:
-            print(f"[fill_category] attempt {attempt}: {e}")
+            logger.warning(f"[fill_category] attempt {attempt}: {e}")
             await page.wait_for_timeout(1000)
     return False
 
 
 # ============================================================
-#  CREATE ONE PAGE
+#  CREATE ONE PAGE  (Semaphore-limited for VPS)
 # ============================================================
 async def create_one_page(cookie: str, log=None):
     async def note(msg):
@@ -503,116 +577,115 @@ async def create_one_page(cookie: str, log=None):
 
     page_name = random_page_name()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=HEADLESS,
-            slow_mo=250 if not HEADLESS else 0,
-            args=["--disable-blink-features=AutomationControlled", "--disable-gpu"],
-        )
-        try:
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 850},
-                locale="en-US",
+    async with BROWSER_SEMAPHORE:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=HEADLESS,
+                slow_mo=250 if not HEADLESS else 0,
+                args=CHROMIUM_ARGS,
             )
-            await context.add_cookies(parse_cookies(cookie))
-            page = await context.new_page()
-            page.set_default_timeout(30000)
-
-            # 1. LOGIN
-            await note("🌐 Loading facebook.com...")
-            await page.goto("https://www.facebook.com/",
-                            wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(4000)
-            if "/login" in page.url or "checkpoint" in page.url:
-                raise RuntimeError("Cookie expired or checkpoint required.")
-
-            # 2. PAGES HOME
-            await note("📄 Opening Pages...")
-            await page.goto(
-                "https://www.facebook.com/pages/?category=top&ref=bookmarks",
-                wait_until="domcontentloaded", timeout=60000,
-            )
-            await page.wait_for_timeout(4000)
-
-            # 3. CREATE PAGE (top)
-            await note("🖱️ Clicking Create Page...")
-            btn = page.locator('[aria-label="Create Page"]').first
-            await btn.wait_for(state="visible", timeout=20000)
-            await btn.click()
-            await page.wait_for_timeout(3500)
-
-            # 4. PUBLIC PAGE
-            await note("🖱️ Selecting Public Page...")
-            public_label = page.locator('label:has-text("Public Page")').first
-            await public_label.wait_for(state="visible", timeout=15000)
-            await public_label.click()
-            await page.wait_for_timeout(1200)
-
-            # 5. NEXT (option modal)
-            await note("🖱️ Next (option step)...")
-            await page.locator('[aria-label="Next"]').first.click()
-            await page.wait_for_timeout(3000)
-
-            # 6. GET STARTED
-            await note("🖱️ Get started...")
             try:
-                await page.locator('[aria-label="Get started"]').first.click(timeout=10000)
-            except PWTimeout:
-                await page.locator('a:has-text("Get started")').first.click(timeout=10000)
-            await page.wait_for_load_state("domcontentloaded")
-            await page.wait_for_timeout(4500)
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1366, "height": 850},
+                    locale="en-US",
+                )
+                await context.add_cookies(parse_cookies(cookie))
+                page = await context.new_page()
+                page.set_default_timeout(30000)
 
-            # 7. PAGE NAME
-            await note(f"✍️ Name: {page_name}")
-            name_input = page.locator('input[type="text"]').first
-            await name_input.wait_for(state="visible", timeout=15000)
-            try:
-                await page.locator('label:has-text("Page name")').first.click(timeout=4000)
-            except Exception:
-                await name_input.click(force=True)
-            await page.wait_for_timeout(400)
-            await name_input.fill(page_name)
-            await page.wait_for_timeout(1000)
+                # 1. LOGIN
+                await note("🌐 Loading facebook.com...")
+                await page.goto("https://www.facebook.com/",
+                                wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(4000)
+                if "/login" in page.url or "checkpoint" in page.url:
+                    raise RuntimeError("Cookie expired or checkpoint required.")
 
-            # 8. CATEGORY
-            await note("🔍 Selecting category: Entertainment...")
-            cat_input = page.locator('input[aria-label="Category (required)"]').first
-            await cat_input.wait_for(state="attached", timeout=20000)
-            if not await fill_category(page, cat_input, "Entertainment", max_retries=3):
-                raise RuntimeError("Category selection failed after 3 attempts.")
+                # 2. PAGES HOME
+                await note("📄 Opening Pages...")
+                await page.goto(
+                    "https://www.facebook.com/pages/?category=top&ref=bookmarks",
+                    wait_until="domcontentloaded", timeout=60000,
+                )
+                await page.wait_for_timeout(4000)
 
-            # ============================================================
-            # 9. FOOTER CREATE PAGE → WAIT 15s → RELOAD
-            # ============================================================
-            await note("🖱️ Clicking footer Create Page...")
-            footer_btn = page.locator('[aria-label="Create Page"]').last
-            for _ in range(15):
-                if (await footer_btn.get_attribute("aria-disabled")) != "true":
-                    break
-                await page.wait_for_timeout(500)
-            await footer_btn.click()
+                # 3. CREATE PAGE (top)
+                await note("🖱️ Clicking Create Page...")
+                btn = page.locator('[aria-label="Create Page"]').first
+                await btn.wait_for(state="visible", timeout=20000)
+                await btn.click()
+                await page.wait_for_timeout(3500)
 
-            await note("⏳ Waiting 15s for page to be created...")
-            await page.wait_for_timeout(POST_CREATE_WAIT_MS)
+                # 4. PUBLIC PAGE
+                await note("🖱️ Selecting Public Page...")
+                public_label = page.locator('label:has-text("Public Page")').first
+                await public_label.wait_for(state="visible", timeout=15000)
+                await public_label.click()
+                await page.wait_for_timeout(1200)
 
-            await note("🔄 Refreshing page...")
-            try:
-                await page.reload(wait_until="domcontentloaded", timeout=60000)
-            except Exception as e:
-                print(f"[reload] {e}")
-            await page.wait_for_timeout(4000)
+                # 5. NEXT (option modal)
+                await note("🖱️ Next (option step)...")
+                await page.locator('[aria-label="Next"]').first.click()
+                await page.wait_for_timeout(3000)
 
-            final_url = page.url
-            await note("✅ Page created.")
+                # 6. GET STARTED
+                await note("🖱️ Get started...")
+                try:
+                    await page.locator('[aria-label="Get started"]').first.click(timeout=10000)
+                except PWTimeout:
+                    await page.locator('a:has-text("Get started")').first.click(timeout=10000)
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(4500)
 
-            return {"name": page_name, "url": final_url, "success": True}
-        finally:
-            await browser.close()
+                # 7. PAGE NAME
+                await note(f"✍️ Name: {page_name}")
+                name_input = page.locator('input[type="text"]').first
+                await name_input.wait_for(state="visible", timeout=15000)
+                try:
+                    await page.locator('label:has-text("Page name")').first.click(timeout=4000)
+                except Exception:
+                    await name_input.click(force=True)
+                await page.wait_for_timeout(400)
+                await name_input.fill(page_name)
+                await page.wait_for_timeout(1000)
+
+                # 8. CATEGORY
+                await note("🔍 Selecting category: Entertainment...")
+                cat_input = page.locator('input[aria-label="Category (required)"]').first
+                await cat_input.wait_for(state="attached", timeout=20000)
+                if not await fill_category(page, cat_input, "Entertainment", max_retries=3):
+                    raise RuntimeError("Category selection failed after 3 attempts.")
+
+                # 9. FOOTER CREATE PAGE → WAIT 20s → RELOAD
+                await note("🖱️ Clicking footer Create Page...")
+                footer_btn = page.locator('[aria-label="Create Page"]').last
+                for _ in range(15):
+                    if (await footer_btn.get_attribute("aria-disabled")) != "true":
+                        break
+                    await page.wait_for_timeout(500)
+                await footer_btn.click()
+
+                await note("⏳ Waiting 20s for page to be created...")
+                await page.wait_for_timeout(POST_CREATE_WAIT_MS)
+
+                await note("🔄 Refreshing page...")
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=60000)
+                except Exception as e:
+                    logger.warning(f"[reload] {e}")
+                await page.wait_for_timeout(4000)
+
+                final_url = page.url
+                await note("✅ Page created.")
+
+                return {"name": page_name, "url": final_url, "success": True}
+            finally:
+                await browser.close()
 
 
 # ============================================================
@@ -686,7 +759,6 @@ async def run_task(bot, tid: str):
             allt[tid] = t2
             save_tasks(allt)
 
-            # ---- Success message: progress + user + page name ----
             try:
                 await bot.send_message(
                     chat_id,
@@ -709,7 +781,6 @@ async def run_task(bot, tid: str):
                     pass
                 return
 
-            # Wait interval (pause-aware)
             end_time = datetime.now() + timedelta(seconds=interval_sec)
             paused_at = None
             while True:
@@ -733,7 +804,7 @@ async def run_task(bot, tid: str):
     except asyncio.CancelledError:
         return
     except Exception as e:
-        print(f"[run_task] {e}")
+        logger.error(f"[run_task] {e}")
         if chat_id:
             try:
                 await bot.send_message(chat_id, f"💥 Task runner crashed: {sanitize_error(e)}")
@@ -1238,6 +1309,13 @@ async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  MAIN
 # ============================================================
 def main():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is not set in environment variables!")
+        sys.exit(1)
+    if not ALLOWED_USER_ID:
+        logger.error("ALLOWED_USER_ID is not set in environment variables!")
+        sys.exit(1)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -1262,12 +1340,11 @@ def main():
         allow_reentry=True,
     )
 
-    # Admin commands (must be registered BEFORE the conversation handler
-    # so that /add, /remove, /users aren't swallowed)
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("headless", cmd_headless))
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
@@ -1280,10 +1357,12 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pause_task, pattern="^pause:"))
     app.add_handler(CallbackQueryHandler(cb_delete_task, pattern="^delete:"))
 
-    print(f"🤖 Bot running... HEADLESS={HEADLESS}")
-    print(f"👑 Admin ID: {ALLOWED_USER_ID}")
-    print(f"📂 Storage: {TASKS_FILE} | {USERS_FILE}")
-    print(f"👥 Users: {len(load_users())} authorized")
+    logger.info(f"🤖 Bot running... HEADLESS={HEADLESS}")
+    logger.info(f"🔒 Max concurrent browsers: {MAX_CONCURRENT_BROWSERS}")
+    logger.info(f"👑 Admin ID: {ALLOWED_USER_ID}")
+    logger.info(f"📂 Storage: {TASKS_FILE} | {USERS_FILE}")
+    logger.info(f"👥 Users: {len(load_users())} authorized")
+    
     app.run_polling()
 
 

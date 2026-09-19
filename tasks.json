@@ -1,50 +1,75 @@
 {
-  "0bd84dae": {
-    "id": "0bd84dae",
-    "name": "Task 2",
-    "cookie": "datr=2HWtakqdGuAbe46QFyJMwzr8;sb=2HWtagCxO_Z2bzo6Yij6wmo0;m_pixel_ratio=3;dpr=3;wd=980x1764;c_user=61594387953864;ps_l=1;ps_n=1;fr=1sfngWenvrwyy8OYS.AWeByhXKfoPwOtfPS3xLC9HcA7prbPYtkNAIRsQm6U8K00rXxD4.BqrXYF..AAA.0.0.BqrXYF.AWf23N7g1AzNkOI8Jypsf6HG-iM;xs=43%3A536quLo6EIEgxA%3A2%3A1789752831%3A-1%3A-1%3A%3AAcwoqOhEEx82qLf9OSmfasDoXCb6WXk5Zv8RvCQk5w;presence=C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1789752843577%2C%22v%22%3A1%7D;",
-    "user_id": "61594387953864",
+  "5e080330": {
+    "id": "5e080330",
+    "name": "Task 1",
+    "cookie": "datr=kVitapNO9dPvekJ1cNHPQ15x; sb=kVitaiQhA5MeuEIGegGy9jsZ; m_pixel_ratio=1.7937500476837158; dpr=1.7937500476837158; wd=370x688; c_user=61594417623998; xs=10%3AgNsbAX_QAfmN0Q%3A2%3A1789745358%3A-1%3A-1%3A%3AAcwPm4LFBUtR5y-MATS3Bpp9OrXhssRlBHV3rnFl4A; fr=18pydvVyIFHdYVv4e.AWfcMY7cZVcovxgb6UOx8Nr54gbSNcSOijGNvEZ1Y99PHguwEJE.BqrVjR..AAA.0.0.BqrVjS.AWfA5ldq1Kl0-kw9nlC6HLyGnno",
+    "user_id": "61594417623998",
     "target": 10,
-    "interval_min": 10,
+    "interval_min": 6,
     "created": 6,
     "status": "running",
     "history": [
       {
-        "name": "Bright Nest 883",
-        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2341640422&ref_type=pages_tab_launch_point_unified_creation",
-        "time": "2026-09-19T01:09:07.887310"
+        "name": "Silent Studios 610",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=3000044586&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T22:33:12.817131"
       },
       {
-        "name": "Cosmic Zone 401",
-        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2962288828&ref_type=pages_tab_launch_point_unified_creation",
-        "time": "2026-09-19T01:20:04.631375"
+        "name": "Cosmic Nest 755",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=1064399405&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T22:44:12.718926"
       },
       {
-        "name": "Solar Zone 148",
-        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=1981971059&ref_type=pages_tab_launch_point_unified_creation",
-        "time": "2026-09-19T01:31:00.916974"
+        "name": "Neon Circle 835",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=3196002497&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T22:51:12.464945"
       },
       {
-        "name": "Golden Media 610",
-        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=1264038937&ref_type=pages_tab_launch_point_unified_creation",
-        "time": "2026-09-19T01:41:55.832317"
+        "name": "Vibrant Hub 246",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2004429915&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T22:58:11.913959"
       },
       {
-        "name": "Nova Pulse 457",
-        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2765193324&ref_type=pages_tab_launch_point_unified_creation",
-        "time": "2026-09-19T01:52:52.727299"
+        "name": "Prime Wave 227",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=1553723177&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T23:05:17.111029"
       },
       {
-        "name": "Prime Circle 676",
-        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=2314604318&ref_type=pages_tab_launch_point_unified_creation",
-        "time": "2026-09-19T02:03:49.813257"
+        "name": "Cosmic Realm 838",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=3939091351&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T23:12:16.486664"
       }
     ],
-    "created_at": "2026-09-19T01:08:11.161874",
+    "created_at": "2026-09-19T22:32:07.440065",
+    "chat_id": 5705479420,
+    "current_step": "\ud83d\uddb1\ufe0f Selecting Public Page...",
+    "error": null,
+    "next_run_at": "2026-09-19T23:18:16.551601",
+    "tg_user_id": 5705479420,
+    "last_page": "Cosmic Realm 838"
+  },
+  "13787878": {
+    "id": "13787878",
+    "name": "Task 2",
+    "cookie": "datr=yCesaq4LvnnilapZZF2tdnVF; sb=yCesalE3DJUUYj2DWkseGyPb; m_pixel_ratio=2.75; wd=393x873; c_user=61594360985378; xs=14%3ArIb_s_bocDfcZA%3A2%3A1789667292%3A-1%3A-1; locale=en_US; pas=61594360985378%3AGFBSu2eeB0; fr=0zmMydvlokIX28eB6.AWeVeIuHohT375NCuYkFSQESKNrcsnnPm_6PGYFIlv9wGBK1Yjs.BqrCfI..AAA.0.0.BqrCgE.AWcKDyJ6kRCl-FlapAzfYmCvpUY; wl_cbv=v2%3Bclient_version%3A3286%3Btimestamp%3A1789667332; fbl_st=101725201%3BT%3A29827788; vpd=v1%3B731x392x2.75",
+    "user_id": "61594360985378",
+    "target": 10,
+    "interval_min": 8,
+    "created": 1,
+    "status": "running",
+    "history": [
+      {
+        "name": "Silent Realm 618",
+        "url": "https://www.facebook.com/pages/creation/?profile_switcher_unified_creation=469710765&ref_type=pages_tab_launch_point_unified_creation",
+        "time": "2026-09-19T23:18:06.249623"
+      }
+    ],
+    "created_at": "2026-09-19T23:17:07.269992",
     "chat_id": 5705479420,
     "current_step": "Idle",
     "error": null,
-    "next_run_at": "2026-09-19T02:13:49.852240",
-    "last_page": "Prime Circle 676"
+    "next_run_at": "2026-09-19T23:26:05.639809",
+    "tg_user_id": 5705479420,
+    "last_page": "Silent Realm 618"
   }
 }
